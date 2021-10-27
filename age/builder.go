@@ -1,7 +1,9 @@
-package main
+package age
 
 import (
 	"fmt"
+	"math"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -9,21 +11,40 @@ import (
 	"github.com/rhizome-ai/apache-age-go/parser"
 )
 
+const MaxUint = ^uint(0)
+const MaxInt = int(MaxUint >> 1)
+const MinUint = 0
+const MinInt = -MaxInt - 1
+
+type Unmarshaller interface {
+	unmarshal(text string) (Entity, error)
+}
+
 type AGUnmarshaler struct {
+	Unmarshaller
 	ageParser   *parser.AgeParser
-	visitor     *UnmarshalVisitor
+	visitor     parser.AgeVisitor
 	errListener *AGErrorListener
+	vcache      map[int64]interface{}
 }
 
 func NewAGUnmarshaler() *AGUnmarshaler {
+	vcache := make(map[int64]interface{})
+
 	m := &AGUnmarshaler{ageParser: parser.NewAgeParser(nil),
-		visitor: &UnmarshalVisitor{}, errListener: NewAGErrorListener()}
+		visitor:     &UnmarshalVisitor{vcache: vcache},
+		errListener: NewAGErrorListener(),
+		vcache:      vcache,
+	}
 	m.ageParser.AddErrorListener(m.errListener)
 
 	return m
 }
 
 func (p *AGUnmarshaler) unmarshal(text string) (Entity, error) {
+	if len(text) == 0 {
+		return NewSimpleEntity(nil), nil
+	}
 	input := antlr.NewInputStream(text)
 	lexer := parser.NewAgeLexer(input)
 	stream := antlr.NewCommonTokenStream(lexer, 0)
@@ -74,6 +95,7 @@ func (el *AGErrorListener) clearErrs() {
 
 type UnmarshalVisitor struct {
 	parser.AgeVisitor
+	vcache map[int64]interface{}
 }
 
 func (v *UnmarshalVisitor) Visit(tree antlr.ParseTree) interface{} { return nil }
@@ -97,7 +119,13 @@ func (v *UnmarshalVisitor) VisitVertex(ctx *parser.VertexContext) interface{} {
 	propCtx := ctx.Properties()
 	props := propCtx.Accept(v).(map[string]interface{})
 	// fmt.Println(" * VisitVertex:", props)
-	vertex := NewVertex(props["id"].(int64), props["label"].(string), props["properties"].(map[string]interface{}))
+	vid := int64(props["id"].(int64))
+	vertex, ok := v.vcache[vid]
+
+	if !ok {
+		vertex = NewVertex(vid, props["label"].(string), props["properties"].(map[string]interface{}))
+		v.vcache[vid] = vertex
+	}
 
 	return vertex
 }
@@ -108,8 +136,8 @@ func (v *UnmarshalVisitor) VisitEdge(ctx *parser.EdgeContext) interface{} {
 	props := propCtx.Accept(v).(map[string]interface{})
 	// fmt.Println(" * VisitEdge:", props)
 
-	edge := NewEdge(props["id"].(int64), props["label"].(string),
-		props["start_id"].(int64), props["end_id"].(int64),
+	edge := NewEdge(int64(props["id"].(int64)), props["label"].(string),
+		int64(props["start_id"].(int64)), int64(props["end_id"].(int64)),
 		props["properties"].(map[string]interface{}))
 
 	return edge
@@ -117,14 +145,23 @@ func (v *UnmarshalVisitor) VisitEdge(ctx *parser.EdgeContext) interface{} {
 
 // Visit a parse tree produced by AgeParser#path.
 func (v *UnmarshalVisitor) VisitPath(ctx *parser.PathContext) interface{} {
-	vctxArr := ctx.AllVertex()
+	entities := []Entity{}
 
-	start := vctxArr[0].Accept(v)
-	rel := ctx.Edge().Accept(v)
-	end := vctxArr[1].Accept(v)
+	for _, child := range ctx.GetChildren() {
+		switch child.(type) {
+		case *parser.VertexContext:
+			v := child.(*parser.VertexContext).Accept(v)
+			// fmt.Println(v)
+			entities = append(entities, v.(Entity))
+		case *parser.EdgeContext:
+			e := child.(*parser.EdgeContext).Accept(v)
+			// fmt.Println(e)
+			entities = append(entities, e.(Entity))
+		default:
+		}
+	}
 
-	// fmt.Println("VisitPath:", reflect.TypeOf(start), reflect.TypeOf(rel), reflect.TypeOf(rel))
-	path := NewPath(start.(*Vertex), rel.(*Edge), end.(*Vertex))
+	path := NewPath(entities)
 	return path
 }
 
@@ -169,8 +206,8 @@ func (v *UnmarshalVisitor) VisitArr(ctx *parser.ArrContext) interface{} {
 	for _, child := range ctx.GetChildren() {
 		switch child.(type) {
 		case *antlr.TerminalNodeImpl:
-			el := child.(*antlr.TerminalNodeImpl).GetText()
-			arr = append(arr, el)
+			// skip
+			break
 		default:
 			el := child.(antlr.ParserRuleContext).Accept(v)
 			arr = append(arr, el)
@@ -184,21 +221,41 @@ func unmarshalTerm(ctx *antlr.TerminalNodeImpl) (interface{}, error) {
 	switch ctx.GetSymbol().GetTokenType() {
 	case parser.AgeLexerSTRING:
 		return strings.Trim(txt, "\""), nil
+	case parser.AgeLexerNUMERIC:
+		numStr := txt[:len(txt)-9]
+		// fmt.Println("txt   ", txt)
+		// fmt.Println("numStr", numStr)
+		if strings.Contains(numStr, ".") {
+			bi := new(big.Float)
+			bi, ok := bi.SetString(numStr)
+			if !ok {
+				return nil, &AgeParseError{msg: "Parse big float " + txt}
+			}
+			return bi, nil
+		} else {
+			bi := new(big.Int)
+			bi, ok := bi.SetString(numStr, 10)
+			if !ok {
+				return nil, &AgeParseError{msg: "Parse big int " + txt}
+			}
+			return bi, nil
+		}
 	case parser.AgeLexerNUMBER:
 		if strings.Contains(txt, ".") {
-			s, err := strconv.ParseFloat(txt, 64)
-			if err != nil {
-				return nil, err
-			} else {
-				return s, nil
-			}
+			return strconv.ParseFloat(txt, 64)
 		} else {
-			s, err := strconv.ParseInt(txt, 10, 64)
-			if err != nil {
-				return nil, err
-			} else {
-				return s, nil
-			}
+			return strconv.ParseInt(txt, 10, 64)
+		}
+	case parser.AgeLexerFLOAT_EXPR:
+		switch txt {
+		case "NaN":
+			return math.NaN(), nil
+		case "-Infinity":
+			return math.Inf(-1), nil
+		case "Infinity":
+			return math.Inf(1), nil
+		default:
+			return nil, &AgeParseError{msg: "Unknown float expression" + txt}
 		}
 	case parser.AgeLexerBOOL:
 		s, err := strconv.ParseBool(txt)
